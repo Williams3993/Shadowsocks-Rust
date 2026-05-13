@@ -7,10 +7,11 @@ export PATH
 #	Description: Shadowsocks Rust 管理脚本
 #	Author: 翠花
 #	WebSite: https://aapls.com
+#	Modified: 修复重启后服务无法自动启动的问题
 #=================================================
 
 # 当前脚本版本号
-sh_ver="1.5.4"
+sh_ver="1.5.4-fix1"
 
 # Shadowsocks Rust 相关路径
 SS_Folder="/etc/ss-rust"
@@ -124,9 +125,7 @@ check_ver_comparison(){
 		[[ -z "${yn}" ]] && yn="y"
 		if [[ $yn == [Yy] ]]; then
 			check_status
-			# [[ "$status" == "running" ]] && systemctl stop ss-rust
 			\cp "${SS_Conf}" "/tmp/config.json"
-			# rm -rf ${SS_Folder}
 			download
 			mv -f "/tmp/config.json" "${SS_Conf}"
 			restart
@@ -190,8 +189,6 @@ backup_download() {
 download() {
 	if [[ ! -e "${SS_Folder}" ]]; then
 		mkdir "${SS_Folder}"
-	# else
-		# [[ -e "${SS_File}" ]] && rm -rf "${SS_File}"
 	fi
 	stable_download
 	if [[ $? != 0 ]]; then
@@ -327,49 +324,127 @@ set_stls_fallback(){
 	echo "========================================" && echo
 }
 
+#=================================================
+# 【修复】service() - 解决重启后服务不自启
+# 原版问题:
+#   1. Wants 了 systemd-networkd-wait-online.service
+#      非 systemd-networkd 系统上启动链会卡住
+#   2. User=root 和 DynamicUser=true 冲突
+#   3. ExecStartPre 里 ulimit 在子 shell 无效
+#   4. 缺少 daemon-reload
+#=================================================
 service(){
-	echo "
-[Unit]
-Description= Shadowsocks Rust Service
-After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
-[Service]
-LimitNOFILE=32767 
-Type=simple
-User=root
-Restart=on-failure
-RestartSec=5s
-DynamicUser=true
-ExecStartPre=/bin/sh -c 'ulimit -n 51200'
-ExecStart=${SS_File} -c ${SS_Conf}
-[Install]
-WantedBy=multi-user.target" > /etc/systemd/system/ss-rust.service
-systemctl enable --now ss-rust
+	cat > /etc/systemd/system/ss-rust.service <<-EOF
+	[Unit]
+	Description=Shadowsocks Rust Service
+	Documentation=https://github.com/shadowsocks/shadowsocks-rust
+	After=network-online.target nss-lookup.target
+	Wants=network-online.target
+
+	[Service]
+	Type=simple
+	User=root
+	LimitNOFILE=51200
+	Restart=on-failure
+	RestartSec=5s
+	ExecStart=${SS_File} -c ${SS_Conf}
+
+	[Install]
+	WantedBy=multi-user.target
+	EOF
+	systemctl daemon-reload
+	systemctl enable ss-rust.service >/dev/null 2>&1
+	if systemctl is-enabled ss-rust.service >/dev/null 2>&1; then
+		echo -e "${Info} Shadowsocks Rust 已设置为开机自启动"
+	else
+		echo -e "${Error} 开机自启设置失败,请手动执行: systemctl enable ss-rust"
+	fi
+	systemctl start ss-rust.service
 	echo -e "${Info} Shadowsocks Rust 服务配置完成！"
 }
 
+#=================================================
+# 【修复】service_stls() - 同上
+#=================================================
 service_stls(){
-	cat > /etc/systemd/system/shadowtls.service<<-EOF
-[Unit]
-Description=Shadow TLS Service
-After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
+	cat > /etc/systemd/system/shadowtls.service <<-EOF
+	[Unit]
+	Description=Shadow TLS Service
+	Documentation=https://github.com/ihciah/shadow-tls
+	After=network-online.target nss-lookup.target
+	Wants=network-online.target
 
-[Service]
-LimitNOFILE=32767
-Type=simple
-User=root
-Restart=on-failure
-RestartSec=5s
-Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-ExecStartPre=/bin/sh -c 'ulimit -n 51200'
-ExecStart=${STLS_File} config --config ${STLS_Conf}
+	[Service]
+	Type=simple
+	User=root
+	LimitNOFILE=51200
+	Restart=on-failure
+	RestartSec=5s
+	Environment=MONOIO_FORCE_LEGACY_DRIVER=1
+	ExecStart=${STLS_File} config --config ${STLS_Conf}
 
-[Install]
-WantedBy=multi-user.target
-EOF
-	systemctl enable --now shadowtls
+	[Install]
+	WantedBy=multi-user.target
+	EOF
+	systemctl daemon-reload
+	systemctl enable shadowtls.service >/dev/null 2>&1
+	if systemctl is-enabled shadowtls.service >/dev/null 2>&1; then
+		echo -e "${Info} Shadow TLS 已设置为开机自启动"
+	else
+		echo -e "${Error} 开机自启设置失败,请手动执行: systemctl enable shadowtls"
+	fi
+	systemctl start shadowtls.service
 	echo -e "${Info} Shadow TLS 服务配置完成！"
+}
+
+#=================================================
+# 【新增】fix_autostart() - 一键修复现有系统的开机自启
+# 不需要重装,直接重写 service 文件 + reenable
+#=================================================
+fix_autostart(){
+	check_root
+	echo -e "${Info} 开始修复开机自启..."
+	echo
+
+	# 修复 ss-rust
+	if [[ -e ${SS_File} ]]; then
+		echo -e "${Info} 检测到 Shadowsocks Rust,正在重写 service 文件..."
+		systemctl stop ss-rust.service >/dev/null 2>&1
+		service
+		echo
+		echo -e "${Info} 当前 ss-rust 状态:"
+		echo -n "  is-enabled : "
+		systemctl is-enabled ss-rust.service 2>/dev/null
+		echo -n "  is-active  : "
+		systemctl is-active ss-rust.service 2>/dev/null
+		echo
+	else
+		echo -e "${Tip} 未检测到 Shadowsocks Rust,跳过"
+		echo
+	fi
+
+	# 修复 shadowtls
+	if [[ -e ${STLS_File} ]]; then
+		echo -e "${Info} 检测到 Shadow TLS,正在重写 service 文件..."
+		systemctl stop shadowtls.service >/dev/null 2>&1
+		service_stls
+		echo
+		echo -e "${Info} 当前 shadowtls 状态:"
+		echo -n "  is-enabled : "
+		systemctl is-enabled shadowtls.service 2>/dev/null
+		echo -n "  is-active  : "
+		systemctl is-active shadowtls.service 2>/dev/null
+		echo
+	else
+		echo -e "${Tip} 未检测到 Shadow TLS,跳过"
+		echo
+	fi
+
+	echo -e "${Info} 修复完成!"
+	echo -e "${Tip} 建议执行 ${Green_background_prefix} reboot ${Font_color_suffix} 验证开机自启是否生效。"
+	echo -e "${Tip} 重启后用 ${Green_background_prefix} systemctl status ss-rust ${Font_color_suffix} 检查。"
+	echo && echo -n " 按回车键返回主菜单..." && read
+	start_menu
 }
 
 installation_dependency(){
@@ -400,28 +475,19 @@ EOF
 }
 
 write_stls_config(){
-	# 设置默认值
 	[[ -z "${stls_fastopen}" ]] && stls_fastopen="true"
 	[[ -z "${stls_strict}" ]] && stls_strict="true"
 	[[ -z "${stls_tls_wildcard_sni}" ]] && stls_tls_wildcard_sni="authed"
 	[[ -z "${stls_fallback}" ]] && stls_fallback="cloud.tencent.com:443"
 	
-	# 构建 dispatch 配置
 	if [[ -z "${stls_dispatch}" ]]; then
-		# 没有现有配置，使用默认配置
-		# SNI 域名对应的目标地址也使用相同的域名:443
 		stls_dispatch_config="\"${stls_sni}\": \"${stls_sni}:443\",
         \"captive.apple.com\": \"captive.apple.com:443\""
 	else
-		# 有现有配置，需要智能更新 SNI
 		if [[ ! -z "${stls_sni}" && -e ${STLS_Conf} ]]; then
-			# 查找需要更新的 SNI（排除 captive.apple.com）
 			old_sni=$(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | keys[] | select(. != "captive.apple.com")' 2>/dev/null | head -1)
 			if [[ ! -z "${old_sni}" && "${old_sni}" != "null" && "${old_sni}" != "${stls_sni}" ]]; then
-				# 需要替换旧的 SNI 为新的 SNI，同时更新键和值
 				echo -e "${Info} 更新主要 SNI 从 ${old_sni} 到 ${stls_sni}"
-				
-				# 使用 jq 来精确替换键和值
 				stls_dispatch_config=$(cat ${STLS_Conf} | jq -r --arg old_sni "${old_sni}" --arg new_sni "${stls_sni}" '
 					.server.tls_addr.dispatch | 
 					to_entries | 
@@ -429,26 +495,17 @@ write_stls_config(){
 					map("\"\(.key)\": \"\(.value)\"") | 
 					join(",\n        ")
 				' 2>/dev/null)
-				
-				# 如果 jq 处理失败，回退到字符串替换
 				if [[ -z "${stls_dispatch_config}" || "${stls_dispatch_config}" == "null" ]]; then
 					echo -e "${Info} jq 处理失败，使用字符串替换"
-					# 先替换键，再替换对应的值
 					stls_dispatch_config=$(echo "${stls_dispatch}" | sed "s/\"${old_sni}\": \"[^\"]*\"/\"${stls_sni}\": \"${stls_sni}:443\"/g")
 				fi
 			else
-				# 如果没有找到需要更新的 SNI，或者 SNI 已经是正确的，直接使用现有配置
 				stls_dispatch_config="${stls_dispatch}"
 			fi
 		else
 			stls_dispatch_config="${stls_dispatch}"
 		fi
 	fi
-	
-	# 调试信息（可选，用于排查问题）
-	# echo -e "${Info} 调试信息："
-	# echo -e "  stls_sni: ${stls_sni}"
-	# echo -e "  stls_dispatch_config: ${stls_dispatch_config}"
 	
 	cat > ${STLS_Conf}<<-EOF
 {
@@ -472,16 +529,12 @@ write_stls_config(){
 }
 EOF
 	
-	# 验证配置文件是否正确生成
 	if [[ -e ${STLS_Conf} ]]; then
-		# 检查配置文件是否为有效的 JSON
 		if ! jq . ${STLS_Conf} >/dev/null 2>&1; then
 			echo -e "${Error} Shadow TLS 配置文件格式错误！"
 			return 1
 		fi
 		echo -e "${Info} Shadow TLS 配置文件写入成功"
-		
-		# 显示当前配置的 SNI
 		current_sni=$(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | keys[0]' 2>/dev/null)
 		if [[ ! -z "${current_sni}" && "${current_sni}" != "null" ]]; then
 			echo -e "${Info} 当前配置的 SNI: ${Green_font_prefix}${current_sni}${Font_color_suffix}"
@@ -509,7 +562,6 @@ read_stls_config(){
 	stls_strict=$(cat ${STLS_Conf}|jq -r '.strict')
 	stls_tls_wildcard_sni=$(cat ${STLS_Conf}|jq -r '.server.tls_addr.wildcard_sni')
 	stls_fallback=$(cat ${STLS_Conf}|jq -r '.server.tls_addr.fallback')
-	# 读取完整的 dispatch 配置
 	stls_dispatch=$(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | to_entries | map("\"\(.key)\": \"\(.value)\"") | join(",\n        ")')
 }
 
@@ -589,19 +641,14 @@ set_password(){
 			show_2022_password_rule
 		fi
 		read -e -p "(默认：随机生成)：" password
-		# 当用户未输入密码时，执行默认生成逻辑
 		if [[ -z "${password}" ]]; then
-			# 判断是否为2022系列加密
 			if [[ ${cipher} == "2022-blake3-aes-256-gcm" || ${cipher} == "2022-blake3-chacha20-poly1305" ]]; then
-				# 2022系列必须使用指定长度的Base64密钥
 				echo -e "${Tip} 为 ${cipher} 生成 32 字节 Base64 密钥..."
 				password=$(openssl rand -base64 32)
 			elif [[ ${cipher} == "2022-blake3-aes-128-gcm" ]]; then
-				# 2022系列必须使用指定长度的Base64密钥
 				echo -e "${Tip} 为 ${cipher} 生成 16 字节 Base64 密钥..."
 				password=$(openssl rand -base64 16)
 			else
-				# 其他加密方式，生成一个普通的16位字母和数字的随机密码
 				echo -e "${Tip} 为 ${cipher} 生成 16 位随机密码 (非Base64)..."
 				password=$(< /dev/urandom tr -dc 'a-zA-Z0-9' | head -c 16)
 			fi
@@ -779,7 +826,6 @@ install(){
 	start
 	echo -e "${Info} Shadowsocks Rust 安装完成！"
 	
-	# 询问是否继续安装 Shadow TLS
 	echo && echo -e "${Tip} 是否继续安装 Shadow TLS 流量伪装？"
 	read -e -p "(默认: N 不安装) [y/N]: " install_stls_choice
 	[[ -z "${install_stls_choice}" ]] && install_stls_choice="n"
@@ -796,7 +842,6 @@ install(){
 install_stls(){
 	[[ -e ${STLS_File} ]] && echo -e "${Error} 检测到 Shadow TLS 已安装！" && exit 1
 	
-	# 检查 Shadowsocks Rust 是否已安装
 	if [[ ! -e ${SS_File} ]]; then
 		echo -e "${Error} 检测到 Shadowsocks Rust 尚未安装！"
 		echo -e "${Info} Shadow TLS 需要配合 Shadowsocks Rust 使用。"
@@ -815,9 +860,8 @@ install_stls(){
 	fi
 	
 	echo -e "${Info} 开始设置 Shadow TLS 配置..."
-	read_config # 读取现有 SS 配置
+	read_config
 	
-	# 使用交互式配置，每项都有默认值
 	echo -e "${Info} 请配置 Shadow TLS 参数（可直接回车使用默认值）："
 	
 	set_stls_port
@@ -844,9 +888,8 @@ install_stls(){
 
 install_stls_after_ss(){
 	echo -e "${Info} 开始设置 Shadow TLS 配置..."
-	read_config # 读取现有 SS 配置
+	read_config
 	
-	# 使用交互式配置，每项都有默认值
 	echo -e "${Info} 请配置 Shadow TLS 参数（可直接回车使用默认值）："
 	
 	set_stls_port
@@ -932,7 +975,7 @@ view_ss_only(){
 }
 
 view_combined_config(){
-	local menu_source="$1"  # 接收调用来源参数
+	local menu_source="$1"
 	check_installed_status
 	read_config
 	getipv4
@@ -943,7 +986,6 @@ view_combined_config(){
 	echo -e "完整配置信息："
 	echo -e "========================================"
 	
-	# 显示 Shadow TLS + SS 配置
 	if [[ -e ${STLS_File} ]]; then
 		read_stls_config
 		echo -e "${Info} Shadow TLS + Shadowsocks Rust 配置："
@@ -966,7 +1008,6 @@ view_combined_config(){
 		echo && echo -e "========================================"
 	fi
 	
-	# 显示纯 SS 配置
 	echo -e "${Info} 原始 Shadowsocks Rust 配置："
 	echo -e "————————————————————————————————————————"
 	[[ "${ipv4}" != "IPv4_Error" ]] && echo -e " 地址：${Green_font_prefix}${ipv4}${Font_color_suffix}"
@@ -984,7 +1025,6 @@ view_combined_config(){
 	fi
 	echo -e "========================================"
 	
-	# 根据调用来源返回到相应菜单
 	if [[ "$menu_source" == "shadowtls" ]]; then
 		echo && echo -n " 按回车键返回 Shadow TLS 菜单..." && read
 		shadowtls_menu
@@ -1005,7 +1045,6 @@ view_combined_config_with_return(){
 	echo -e "完整配置信息："
 	echo -e "========================================"
 	
-	# 显示 Shadow TLS + SS 配置
 	if [[ -e ${STLS_File} ]]; then
 		read_stls_config
 		echo -e "${Info} Shadow TLS + Shadowsocks Rust 配置："
@@ -1028,7 +1067,6 @@ view_combined_config_with_return(){
 		echo && echo -e "========================================"
 	fi
 	
-	# 显示纯 SS 配置
 	echo -e "${Info} 原始 Shadowsocks Rust 配置："
 	echo -e "————————————————————————————————————————"
 	[[ "${ipv4}" != "IPv4_Error" ]] && echo -e " 地址：${Green_font_prefix}${ipv4}${Font_color_suffix}"
@@ -1048,7 +1086,6 @@ view_combined_config_with_return(){
 	echo && echo -n " 按回车键继续..." && read
 }
 
-# 综合 Shadow TLS 配置函数
 set_stls_config(){
 	check_stls_installed_status
 	read_config
@@ -1070,41 +1107,13 @@ set_stls_config(){
 	[[ -z "${modify}" ]] && echo "已取消..." && return
 	
 	case "${modify}" in
-		1)
-			set_stls_port
-			write_stls_config
-			restart_stls
-			;;
-		2)
-			set_stls_password
-			write_stls_config
-			restart_stls
-			;;
-		3)
-			set_stls_sni
-			write_stls_config
-			restart_stls
-			;;
-		4)
-			set_stls_fastopen
-			write_stls_config
-			restart_stls
-			;;
-		5)
-			set_stls_strict
-			write_stls_config
-			restart_stls
-			;;
-		6)
-			set_stls_tls_wildcard_sni
-			write_stls_config
-			restart_stls
-			;;
-		7)
-			set_stls_fallback
-			write_stls_config
-			restart_stls
-			;;
+		1) set_stls_port; write_stls_config; restart_stls ;;
+		2) set_stls_password; write_stls_config; restart_stls ;;
+		3) set_stls_sni; write_stls_config; restart_stls ;;
+		4) set_stls_fastopen; write_stls_config; restart_stls ;;
+		5) set_stls_strict; write_stls_config; restart_stls ;;
+		6) set_stls_tls_wildcard_sni; write_stls_config; restart_stls ;;
+		7) set_stls_fallback; write_stls_config; restart_stls ;;
 		8)
 			manage_stls_dispatch
 			if [[ ! -z "${stls_dispatch}" ]]; then
@@ -1131,7 +1140,6 @@ set_stls_config(){
 	esac
 }
 
-# Dispatch 管理的简化版本
 manage_stls_dispatch(){
 	echo -e "${Info} 当前 dispatch 配置："
 	if [[ -e ${STLS_Conf} ]]; then
@@ -1150,9 +1158,7 @@ ${Green_font_prefix} 2.${Font_color_suffix} 自定义配置所有条目
 	[[ -z "${dispatch_choice}" ]] && dispatch_choice="1"
 	
 	if [[ "${dispatch_choice}" == "1" ]]; then
-		# 使用默认配置，确保使用当前设置的 SNI
 		echo -e "${Info} 使用默认 dispatch 配置，SNI: ${stls_sni}"
-		# 不设置 stls_dispatch，让 write_stls_config 使用默认逻辑
 		stls_dispatch=""
 	elif [[ "${dispatch_choice}" == "2" ]]; then
 		echo -e "${Info} 重新配置 dispatch 条目"
@@ -1187,230 +1193,8 @@ ${Green_font_prefix} 2.${Font_color_suffix} 自定义配置所有条目
 			echo -e "${Info} 已配置 ${line_count} 个 dispatch 条目"
 		else
 			echo -e "${Info} 没有输入条目，使用默认 dispatch 配置"
-			# 不设置 stls_dispatch，让 write_stls_config 使用默认逻辑
 			stls_dispatch=""
 		fi
-	fi
-}
-
-# 增强版 Dispatch 管理（支持单条增删改）
-manage_stls_dispatch_advanced(){
-	echo -e "${Info} 当前 dispatch 配置："
-	if [[ -e ${STLS_Conf} ]]; then
-		echo -e "${Green_font_prefix}$(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | to_entries | map("  \(.key) -> \(.value)") | join("\n")')${Font_color_suffix}"
-	else
-		echo -e "  ${stls_sni} -> 1.1.1.1:443"
-		echo -e "  captive.apple.com -> captive.apple.com:443"
-	fi
-	
-	echo && echo -e "请选择 dispatch 管理操作：
-========================================
-${Green_font_prefix} 1.${Font_color_suffix} 保持当前配置
-${Green_font_prefix} 2.${Font_color_suffix} 添加新条目
-${Green_font_prefix} 3.${Font_color_suffix} 删除指定条目
-${Green_font_prefix} 4.${Font_color_suffix} 修改指定条目
-${Green_font_prefix} 5.${Font_color_suffix} 重新配置所有条目
-========================================"
-	read -e -p "(默认：1.保持当前)：" dispatch_choice
-	[[ -z "${dispatch_choice}" ]] && dispatch_choice="1"
-	
-	case "${dispatch_choice}" in
-		1)
-			echo -e "${Info} 保持当前配置"
-			;;
-		2)
-			add_dispatch_entry
-			;;
-		3)
-			delete_dispatch_entry
-			;;
-		4)
-			modify_dispatch_entry
-			;;
-		5)
-			reconfigure_all_dispatch
-			;;
-		*)
-			echo -e "${Error} 输入错误，保持当前配置"
-			;;
-	esac
-}
-
-# 添加 dispatch 条目
-add_dispatch_entry(){
-	echo -e "${Info} 添加新的 dispatch 条目"
-	read -e -p "请输入域名 (如: example.com)：" new_sni
-	if [[ -z "${new_sni}" ]]; then
-		echo -e "${Error} 域名不能为空"
-		return
-	fi
-	
-	read -e -p "请输入目标地址 (如: 1.1.1.1:443)：" new_target
-	if [[ -z "${new_target}" ]]; then
-		echo -e "${Error} 目标地址不能为空"
-		return
-	fi
-	
-	# 获取当前 dispatch 配置
-	if [[ -e ${STLS_Conf} ]]; then
-		current_dispatch=$(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | to_entries | map("\"\(.key)\": \"\(.value)\"") | join(",\n        ")')
-		stls_dispatch="${current_dispatch},
-        \"${new_sni}\": \"${new_target}\""
-	else
-		stls_dispatch="\"${stls_sni}\": \"1.1.1.1:443\",
-        \"captive.apple.com\": \"captive.apple.com:443\",
-        \"${new_sni}\": \"${new_target}\""
-	fi
-	
-	echo -e "${Info} 已添加条目: ${new_sni} -> ${new_target}"
-}
-
-# 删除 dispatch 条目
-delete_dispatch_entry(){
-	if [[ ! -e ${STLS_Conf} ]]; then
-		echo -e "${Error} 配置文件不存在"
-		return
-	fi
-	
-	echo -e "${Info} 当前 dispatch 条目："
-	# 显示带编号的列表
-	local domains=($(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | keys[]'))
-	local targets=($(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | to_entries | map(.value) | .[]'))
-	
-	if [[ ${#domains[@]} -eq 0 ]]; then
-		echo -e "${Error} 没有可删除的条目"
-		return
-	fi
-	
-	for i in "${!domains[@]}"; do
-		echo -e " ${Green_font_prefix}$((i+1)).${Font_color_suffix} ${domains[i]} -> ${targets[i]}"
-	done
-	
-	read -e -p "请输入要删除的条目编号 (1-${#domains[@]})：" del_num
-	if [[ -z "${del_num}" ]] || [[ ${del_num} -lt 1 ]] || [[ ${del_num} -gt ${#domains[@]} ]]; then
-		echo -e "${Error} 输入的编号无效"
-		return
-	fi
-	
-	# 重新构建 dispatch 配置，排除删除的条目
-	local del_domain="${domains[$((del_num-1))]}"
-	local new_entries=""
-	local count=0
-	
-	for i in "${!domains[@]}"; do
-		if [[ "${domains[i]}" != "${del_domain}" ]]; then
-			if [[ ${count} -gt 0 ]]; then
-				new_entries="${new_entries},
-        "
-			fi
-			new_entries="${new_entries}\"${domains[i]}\": \"${targets[i]}\""
-			count=$((count+1))
-		fi
-	done
-	
-	if [[ ${count} -eq 0 ]]; then
-		# 如果删除后没有条目，使用默认配置
-		stls_dispatch="\"${stls_sni}\": \"1.1.1.1:443\",
-        \"captive.apple.com\": \"captive.apple.com:443\""
-	else
-		stls_dispatch="${new_entries}"
-	fi
-	
-	echo -e "${Info} 已删除条目: ${del_domain}"
-}
-
-# 修改 dispatch 条目
-modify_dispatch_entry(){
-	if [[ ! -e ${STLS_Conf} ]]; then
-		echo -e "${Error} 配置文件不存在"
-		return
-	fi
-	
-	echo -e "${Info} 当前 dispatch 条目："
-	# 显示带编号的列表
-	local domains=($(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | keys[]'))
-	local targets=($(cat ${STLS_Conf}|jq -r '.server.tls_addr.dispatch | to_entries | map(.value) | .[]'))
-	
-	if [[ ${#domains[@]} -eq 0 ]]; then
-		echo -e "${Error} 没有可修改的条目"
-		return
-	fi
-	
-	for i in "${!domains[@]}"; do
-		echo -e " ${Green_font_prefix}$((i+1)).${Font_color_suffix} ${domains[i]} -> ${targets[i]}"
-	done
-	
-	read -e -p "请输入要修改的条目编号 (1-${#domains[@]})：" mod_num
-	if [[ -z "${mod_num}" ]] || [[ ${mod_num} -lt 1 ]] || [[ ${mod_num} -gt ${#domains[@]} ]]; then
-		echo -e "${Error} 输入的编号无效"
-		return
-	fi
-	
-	local mod_domain="${domains[$((mod_num-1))]}"
-	local mod_target="${targets[$((mod_num-1))]}"
-	
-	echo -e "${Info} 当前条目: ${mod_domain} -> ${mod_target}"
-	read -e -p "请输入新的域名 (直接回车保持不变)：" new_domain
-	read -e -p "请输入新的目标地址 (直接回车保持不变)：" new_target
-	
-	[[ -z "${new_domain}" ]] && new_domain="${mod_domain}"
-	[[ -z "${new_target}" ]] && new_target="${mod_target}"
-	
-	# 重新构建 dispatch 配置
-	local new_entries=""
-	for i in "${!domains[@]}"; do
-		if [[ ${i} -gt 0 ]]; then
-			new_entries="${new_entries},
-        "
-		fi
-		
-		if [[ ${i} -eq $((mod_num-1)) ]]; then
-			new_entries="${new_entries}\"${new_domain}\": \"${new_target}\""
-		else
-			new_entries="${new_entries}\"${domains[i]}\": \"${targets[i]}\""
-		fi
-	done
-	
-	stls_dispatch="${new_entries}"
-	echo -e "${Info} 已修改条目: ${mod_domain} -> ${mod_target} => ${new_domain} -> ${new_target}"
-}
-
-# 重新配置所有 dispatch 条目
-reconfigure_all_dispatch(){
-	echo -e "${Info} 重新配置所有 dispatch 条目"
-	echo "请输入 dispatch 配置 (每行格式: 域名:目标地址，回车结束)："
-	echo "示例: cloudflare.com:1.1.1.1:443"
-	
-	local dispatch_entries=""
-	local line_count=0
-	while true; do
-		read -e -p "条目 $((line_count+1)) (直接回车结束)：" dispatch_entry
-		if [[ -z "${dispatch_entry}" ]]; then
-			break
-		fi
-		
-		if [[ "${dispatch_entry}" =~ ^([^:]+):(.+)$ ]]; then
-			local sni="${BASH_REMATCH[1]}"
-			local target="${BASH_REMATCH[2]}"
-			
-			if [[ ${line_count} -gt 0 ]]; then
-				dispatch_entries="${dispatch_entries},
-        "
-			fi
-			dispatch_entries="${dispatch_entries}\"${sni}\": \"${target}\""
-			line_count=$((line_count+1))
-		else
-			echo -e "${Error} 格式错误，请使用格式: 域名:目标地址"
-		fi
-	done
-	
-	if [[ ${line_count} -gt 0 ]]; then
-		stls_dispatch="${dispatch_entries}"
-		echo -e "${Info} 已配置 ${line_count} 个 dispatch 条目"
-	else
-		echo -e "${Info} 使用默认 dispatch 配置"
-		stls_dispatch="\"${stls_sni}\": \"1.1.1.1:443\",
-        \"captive.apple.com\": \"captive.apple.com:443\""
 	fi
 }
 
@@ -1499,7 +1283,6 @@ update_stls(){
 	sleep 3s
 }
 
-# 脚本更新函数
 update_sh(){
 	echo -e "当前版本为 [ ${sh_ver} ]，开始检测最新版本..."
 	sh_new_ver=$(wget --no-check-certificate -qO- "https://raw.githubusercontent.com/xOS/Shadowsocks-Rust/master/ss-rust.sh"|grep 'sh_ver="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1)
@@ -1619,7 +1402,6 @@ before_shadowtls_menu(){
 	shadowtls_menu
 }
 
-# Shadow TLS 状态和版本检查函数
 check_stls_installed_status(){
 	[[ ! -e ${STLS_File} ]] && echo -e "${Error} Shadow TLS 没有安装，请检查！" && exit 1
 }
@@ -1652,13 +1434,11 @@ check_stls_ver_comparison(){
 	fi
 }
 
-# Shadow TLS 专用菜单
 shadowtls_menu(){
 	check_root
 	check_sys
 	sys_arch
 	
-	# 检查 Shadow TLS 安装状态
 	if [[ -e ${STLS_File} ]]; then
 		check_stls_status
 		if [[ "$stls_status" == "running" ]]; then
@@ -1698,52 +1478,19 @@ shadowtls_menu(){
 
 	read -e -p " 请输入数字 [0-11]：" stls_num
 	case "$stls_num" in
-		1)
-			install_stls
-			shadowtls_menu
-			;;
-		2)
-			update_stls
-			shadowtls_menu
-			;;
-		3)
-			uninstall_stls
-			shadowtls_menu
-			;;
-		4)
-			start_stls
-			shadowtls_menu
-			;;
-		5)
-			stop_stls
-			shadowtls_menu
-			;;
-		6)
-			restart_stls
-			shadowtls_menu
-			;;
-		7)
-			set_stls_config
-			shadowtls_menu
-			;;
-		8)
-			view_stls_only
-			;;
-		9)
-			view_stls_status
-			;;
-		10)
-			view_combined_config shadowtls
-			;;
-		11)
-			start_menu
-			;;
-		0)
-			update_sh
-			;;
-		00)
-			exit 1
-			;;
+		1) install_stls; shadowtls_menu ;;
+		2) update_stls; shadowtls_menu ;;
+		3) uninstall_stls; shadowtls_menu ;;
+		4) start_stls; shadowtls_menu ;;
+		5) stop_stls; shadowtls_menu ;;
+		6) restart_stls; shadowtls_menu ;;
+		7) set_stls_config; shadowtls_menu ;;
+		8) view_stls_only ;;
+		9) view_stls_status ;;
+		10) view_combined_config shadowtls ;;
+		11) start_menu ;;
+		0) update_sh ;;
+		00) exit 1 ;;
 		*)
 			echo -e "${Error} 请输入正确数字 [0-11] (退出输入00)"
 			sleep 5s
@@ -1752,43 +1499,34 @@ shadowtls_menu(){
 	esac
 }
 
-# 查看 Shadowsocks Rust 状态函数
 view_ss_status(){
 	check_installed_status
-	
 	echo -e "${Info} 正在获取 Shadowsocks Rust 状态信息..."
 	echo
 	echo "=================================="
 	echo -e " Shadowsocks Rust 服务状态"
 	echo "=================================="
-	
 	systemctl status ss-rust
-	
 	echo "=================================="
 	echo
 	read -e -p "按回车键返回主菜单..." 
 	start_menu
 }
 
-# 查看 Shadow TLS 状态函数  
 view_stls_status(){
 	check_stls_installed_status
-	
 	echo -e "${Info} 正在获取 Shadow TLS 状态信息..."
 	echo
 	echo "=================================="
 	echo -e " Shadow TLS 服务状态"
 	echo "=================================="
-	
 	systemctl status shadowtls
-	
 	echo "=================================="
 	echo
 	read -e -p "按回车键返回 Shadow TLS 菜单..." 
 	shadowtls_menu
 }
 
-# 查看 Shadow TLS 配置函数
 view_stls_only(){
 	check_stls_installed_status
 	echo -e "${Info} 正在获取 Shadow TLS 配置信息..."
@@ -1796,13 +1534,11 @@ view_stls_only(){
 	echo "=================================="
 	echo -e " Shadow TLS 配置信息"  
 	echo "=================================="
-	
 	if [[ -f "$STLS_Conf" ]]; then
 		cat "$STLS_Conf"
 	else
 		echo -e "${Error} Shadow TLS 配置文件不存在！"
 	fi
-	
 	echo "=================================="
 	echo
 	read -e -p "按回车键返回 Shadow TLS 菜单..." 
@@ -1819,7 +1555,6 @@ start_menu(){
 	sys_arch
 	echo -e "${Info} 架构检测完成，正在检查服务状态..."
 	
-	# 检查安装状态
 	if [[ -e ${SS_File} ]]; then
 		check_status
 		if [[ "$status" == "running" ]]; then
@@ -1831,7 +1566,6 @@ start_menu(){
 		ss_status_show="${Red_font_prefix}未安装${Font_color_suffix}"
 	fi
 	
-	# 检查 Shadow TLS 安装状态
 	if [[ -e ${STLS_File} ]]; then
 		check_stls_status
 		if [[ "$stls_status" == "running" ]]; then
@@ -1866,57 +1600,28 @@ start_menu(){
 ========================================
  ${Green_font_prefix}10.${Font_color_suffix} 配置 Shadow TLS 相关
  ${Green_font_prefix}11.${Font_color_suffix} 查看完整配置信息
+ ${Green_font_prefix}12.${Font_color_suffix} ${Yellow_font_prefix}【新增】修复开机自启动${Font_color_suffix}
 ————————————————————————————————————————
  ${Green_font_prefix}00.${Font_color_suffix} 退出脚本
 ========================================" && echo
-	read -e -p " 请输入数字 [0-11]：" num
+	read -e -p " 请输入数字 [0-12]：" num
 	case "$num" in
-		1)
-			install
-			;;
-		2)
-			update
-			start_menu
-			;;
-		3)
-			uninstall
-			start_menu
-			;;
-		4)
-			start
-			start_menu
-			;;
-		5)
-			stop
-			start_menu
-			;;
-		6)
-			restart
-			start_menu
-			;;
-		7)
-			set_config
-			;;
-		8)
-			view
-			;;
-		9)
-			view_ss_status
-			;;
-		10)
-			shadowtls_menu
-			;;
-		11)
-			view_combined_config
-			;;
-		0)
-			update_sh
-			;;
-		00)
-			exit 1
-			;;
+		1) install ;;
+		2) update; start_menu ;;
+		3) uninstall; start_menu ;;
+		4) start; start_menu ;;
+		5) stop; start_menu ;;
+		6) restart; start_menu ;;
+		7) set_config ;;
+		8) view ;;
+		9) view_ss_status ;;
+		10) shadowtls_menu ;;
+		11) view_combined_config ;;
+		12) fix_autostart ;;
+		0) update_sh ;;
+		00) exit 1 ;;
 		*)
-			echo -e "${Error} 请输入正确数字 [0-11] (退出输入00)"
+			echo -e "${Error} 请输入正确数字 [0-12] (退出输入00)"
 			sleep 5s
 			start_menu
 			;;
